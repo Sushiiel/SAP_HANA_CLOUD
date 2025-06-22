@@ -10,13 +10,13 @@ This project is an interactive **Streamlit** web application that connects to **
 ![SAP HANA Instance](images/pic1.png)
 
 ### 🧑‍💻 App UI - Product Insights Page
-![App UI](images/ui_working.png)
+![App UI](images/pic2.png)
 
 ### ➕ Before Inserting New Product
-![Before Insert](images/before_insert.png)
+![Before Insert](images/pic3.png)
 
 ### ✅ After Inserting New Product Using AI
-![After Insert](images/after_insert.png)
+![After Insert](images/pic4.png)
 
 ---
 
@@ -45,5 +45,5 @@ This project is an interactive **Streamlit** web application that connects to **
 
 ### 1. Clone this Repository
 ```bash
-git clone https://github.com/your-username/retail-insights-hana.git
-cd retail-insights-hana
+git clone https://github.com/Sushiiel/SAP_HANA_CLOUD.git
+
