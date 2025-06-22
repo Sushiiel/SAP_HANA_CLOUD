@@ -7,7 +7,7 @@ This project is an interactive **Streamlit** web application that connects to **
 ## 📸 Project Snapshots
 
 ### 🔧 SAP HANA Cloud Instance Running
-![SAP HANA Instance](images/instance_dashboard.png)
+![SAP HANA Instance](images/pic1.png)
 
 ### 🧑‍💻 App UI - Product Insights Page
 ![App UI](images/ui_working.png)
