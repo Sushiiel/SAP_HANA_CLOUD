@@ -9,13 +9,18 @@ import cohere
 import pytz
 
 SCHEMA_NAME="SMART_RETAIL1"
-hana_config={
-    'address':'5b88e881-d6dd-4f02-8268-0cb145f3e415.hana.trial-us10.hanacloud.ondemand.com',
-    'port':443,
-    'user':'DBADMIN',
-    'password':'595162sushiielA@',
-    'encrypt':True,
-    'sslValidateCertificate':False
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+hana_config = {
+    'address': os.getenv("HANA_ADDRESS"),
+    'port': int(os.getenv("HANA_PORT")),
+    'user': os.getenv("HANA_USER"),
+    'password': os.getenv("HANA_PASSWORD"),
+    'encrypt': True,
+    'sslValidateCertificate': False
 }
 co=cohere.Client("Aa59ZsypfvMKRFOMo7E0O32OAVXNAx6r7okISHYt")
 
