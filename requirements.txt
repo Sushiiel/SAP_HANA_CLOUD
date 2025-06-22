@@ -1,7 +1,7 @@
-streamlit==1.35.0
-cohere==4.45
-sentence-transformers==2.6.1
-hdbcli==2.18.17
-numpy==1.26.4
-pytz==2024.1
+streamlit
+sentence-transformers
+cohere
+hdbcli
 python-dotenv
+numpy
+rich
