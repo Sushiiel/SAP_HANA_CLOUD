@@ -49,4 +49,4 @@ git clone https://github.com/Sushiiel/SAP_HANA_CLOUD.git
 
 ### 2. Deployed UI
 
-[Deployed Application](https://sap-hana-cloud.streamlit.app/)
+- **APP**:[Deployed Application](https://sap-hana-cloud.streamlit.app/)
