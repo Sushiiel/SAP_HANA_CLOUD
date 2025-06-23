@@ -38,7 +38,8 @@ This project is an interactive **Streamlit** web application that connects to **
 - **LLM**: [Cohere `command-r-plus`](https://cohere.com/)
 - **Language**: Python 3.11+
 - **DB Driver**: `hdbcli` (SAP HANA Python Client)
-
+- **Deployed App**:[Deployed Application](https://sap-hana-cloud.streamlit.app/)
+  
 ---
 
 ## 🚀 Setup Instructions
@@ -49,4 +50,4 @@ git clone https://github.com/Sushiiel/SAP_HANA_CLOUD.git
 
 ### 2. Deployed UI
 
-- **APP**:[Deployed Application](https://sap-hana-cloud.streamlit.app/)
+
