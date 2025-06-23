@@ -47,3 +47,5 @@ This project is an interactive **Streamlit** web application that connects to **
 ```bash
 git clone https://github.com/Sushiiel/SAP_HANA_CLOUD.git
 
+### 2. Deployed UI
+https://sap-hana-cloud.streamlit.app/
