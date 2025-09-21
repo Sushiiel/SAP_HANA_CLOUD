@@ -1,9 +1,8 @@
-# st_app.py
+# st_app.py (updated)
 import os
 import socket
 import time
 import traceback
-import pickle
 from datetime import datetime
 
 import streamlit as st
@@ -19,26 +18,30 @@ SCHEMA_NAME = os.environ.get("HANA_SCHEMA", "SMART_RETAIL1")
 # Read HANA config from environment (Render-friendly). Also allow Streamlit secrets.
 def _read_hana_config():
     # Prefer st.secrets if present (Streamlit cloud), otherwise environment variables (Render)
-    if st.secrets and "hana" in st.secrets:
-        hana = st.secrets["hana"]
-        return {
-            "address": hana.get("address"),
-            "port": int(hana.get("port", 443)),
-            "user": hana.get("user"),
-            "password": hana.get("password"),
-            "encrypt": hana.get("encrypt", True),
-            "sslValidateCertificate": hana.get("sslValidateCertificate", False),
-        }
-    else:
-        # Render will supply env vars; don't commit secrets to repo
-        return {
-            "address": os.environ.get("HANA_ADDRESS"),
-            "port": int(os.environ.get("HANA_PORT", 443)),
-            "user": os.environ.get("HANA_USER"),
-            "password": os.environ.get("HANA_PASSWORD"),
-            "encrypt": os.environ.get("HANA_ENCRYPT", "true").lower() in ("1", "true", "yes"),
-            "sslValidateCertificate": os.environ.get("HANA_SSL_VALIDATE", "false").lower() in ("1", "true", "yes"),
-        }
+    try:
+        if st.secrets and "hana" in st.secrets:
+            hana = st.secrets["hana"]
+            return {
+                "address": hana.get("address"),
+                "port": int(hana.get("port", 443)),
+                "user": hana.get("user"),
+                "password": hana.get("password"),
+                "encrypt": hana.get("encrypt", True),
+                "sslValidateCertificate": hana.get("sslValidateCertificate", False),
+            }
+    except Exception:
+        # If st.secrets isn't available or access fails, fall back to env
+        pass
+
+    return {
+        "address": os.environ.get("HANA_ADDRESS"),
+        "port": int(os.environ.get("HANA_PORT", 443)),
+        "user": os.environ.get("HANA_USER"),
+        "password": os.environ.get("HANA_PASSWORD"),
+        # env vars come as strings; coerce to bool sensibly
+        "encrypt": os.environ.get("HANA_ENCRYPT", "true").lower() in ("1", "true", "yes"),
+        "sslValidateCertificate": os.environ.get("HANA_SSL_VALIDATE", "false").lower() in ("1", "true", "yes"),
+    }
 
 hana_config = _read_hana_config()
 
@@ -52,39 +55,97 @@ def tcp_check(host: str, port: int, timeout: float = 6.0):
     except Exception as e:
         return False, str(e)
 
-# Cached connection builder
-@st.cache_resource
-def get_connection(retries: int = 3, backoff_s: float = 1.5):
+# CONNECTION MANAGEMENT (no long-lived cached socket)
+def _validate_connection(conn):
+    """
+    Validate a HANA connection by running a lightweight query.
+    Return True if valid, False otherwise.
+    """
+    try:
+        if conn is None:
+            return False
+        # run a tiny validation query
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM DUMMY")
+            _ = cur.fetchall()
+        return True
+    except Exception:
+        return False
+
+def get_connection(retries: int = 4, base_backoff: float = 1.0):
+    """
+    Return a (conn, cursor) tuple. This function keeps a connection in session_state
+    and re-creates it on demand if validation fails. Avoids caching closed sockets.
+    """
     if dbapi is None:
-        raise RuntimeError("Python package 'hdbcli' is not installed in the environment. Install it (or use a proxy/CF deployment).")
+        raise RuntimeError("Python package 'hdbcli' is not installed in the environment. Install it (pip install hdbcli) or deploy a proxy/CF app.")
+
     host = hana_config.get("address")
     port = hana_config.get("port")
 
     if not host or not port:
-        raise RuntimeError("HANA configuration missing. Set HANA_ADDRESS and HANA_PORT environment variables.")
+        raise RuntimeError("HANA configuration missing. Set HANA_ADDRESS and HANA_PORT environment variables or provide st.secrets['hana'].")
 
+    # if we have a live connection in session_state, validate it and return
+    session_conn = st.session_state.get("hana_conn")
+    if _validate_connection(session_conn):
+        try:
+            # Create a cursor on demand for each operation
+            cur = session_conn.cursor()
+            return session_conn, cur
+        except Exception:
+            # fall through to create new connection
+            pass
+
+    # Pre-check TCP (helpful to fail fast on network issues)
     ok, msg = tcp_check(host, port, timeout=6.0)
     if not ok:
-        raise ConnectionError(f"TCP check to {host}:{port} failed -> {msg}")
+        # We continue to attempt connecting (hdbcli may behave differently), but surface pre-check feedback
+        st.warning(f"TCP pre-check to {host}:{port} failed -> {msg}")
 
     last_exc = None
     for attempt in range(1, retries + 1):
         try:
             conn = dbapi.connect(**hana_config)
-            return conn
-        except Exception as e:
-            last_exc = e
-            time.sleep(backoff_s * attempt)
+            # quick validation
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM DUMMY")
+                _ = cur.fetchall()
+            # store in session_state for reuse
+            st.session_state["hana_conn"] = conn
+            cur = conn.cursor()
+            return conn, cur
+        except Exception as exc:
+            last_exc = exc
+            backoff = base_backoff * (2 ** (attempt - 1))
+            time.sleep(backoff)
 
     tb = "".join(traceback.format_exception(type(last_exc), last_exc, last_exc.__traceback__))
     raise RuntimeError(f"Unable to connect to HANA after {retries} attempts. Last error: {last_exc}\nTraceback:\n{tb}")
 
+# Safe helper to close stored connection
+def close_session_connection():
+    try:
+        c = st.session_state.get("hana_conn")
+        if c:
+            try:
+                c.close()
+            except Exception:
+                pass
+            st.session_state.pop("hana_conn", None)
+    except Exception:
+        pass
+
 # Try to establish connection at startup (fail gracefully with a helpful message)
-conn = None
-cursor = None
+# We don't keep a global cursor; use get_connection() to obtain a fresh cursor per operation.
 try:
-    conn = get_connection()
-    cursor = conn.cursor()
+    # attempt quick connect to populate session_state
+    conn_tmp, cur_tmp = get_connection()
+    # close the temporary cursor (we'll create new ones as needed)
+    try:
+        cur_tmp.close()
+    except Exception:
+        pass
 except Exception as e:
     st.error("🚨 HANA connection failed. See diagnostics below (do NOT commit credentials).")
     st.exception(e)
@@ -99,14 +160,16 @@ except Exception as e:
             st.success("TCP check: OK (" + msg + ")")
         else:
             st.error("TCP check failed: " + msg)
-        st.write("If you see 'Socket closed by peer' or 'Invalid connect reply', the HANA instance likely restricts SQL access. Use Cloud Foundry or a proxy inside the BTP subaccount.")
+        st.write("If you see 'Socket closed by peer' or 'Invalid connect reply', the HANA instance may restrict SQL access. Deploy a proxy or Cloud Foundry app in the same BTP subaccount, or ensure the HANA service allows your runner's egress IPs.")
     st.stop()
 
-# DB helper functions (safe, with clear errors)
+# DB helper functions (safe, each obtains a fresh cursor)
 def fetch_product_names():
     try:
+        conn, cursor = get_connection()
         cursor.execute(f'SELECT DISTINCT NAME FROM "{SCHEMA_NAME}"."PRODUCT_EMBEDDINGS"')
         rows = cursor.fetchall()
+        cursor.close()
         return [r[0] for r in rows] if rows else []
     except Exception as e:
         st.error("Failed to fetch product names from HANA.")
@@ -115,8 +178,10 @@ def fetch_product_names():
 
 def get_product_description(name):
     try:
+        conn, cursor = get_connection()
         cursor.execute(f'SELECT DESCRIPTION FROM "{SCHEMA_NAME}"."PRODUCT_EMBEDDINGS" WHERE NAME = ?', (name,))
         row = cursor.fetchone()
+        cursor.close()
         return row[0] if row else "No description found."
     except Exception as e:
         st.error("Failed to fetch description.")
@@ -125,6 +190,7 @@ def get_product_description(name):
 
 def insert_product(name, description):
     try:
+        conn, cursor = get_connection()
         cursor.execute(f'SELECT MAX(PRODUCT_ID) FROM "{SCHEMA_NAME}"."PRODUCT_EMBEDDINGS"')
         row = cursor.fetchone()
         max_id = row[0] if row and row[0] is not None else 0
@@ -134,6 +200,7 @@ def insert_product(name, description):
             (new_id, name, description, None)
         )
         conn.commit()
+        cursor.close()
         return {"status": "ok", "product_id": new_id}
     except Exception as e:
         st.error("Insert failed.")
@@ -142,12 +209,15 @@ def insert_product(name, description):
 
 def update_product_description(name, new_description):
     try:
+        conn, cursor = get_connection()
         cursor.execute(
             f'UPDATE "{SCHEMA_NAME}"."PRODUCT_EMBEDDINGS" SET DESCRIPTION = ? WHERE NAME = ?',
             (new_description, name)
         )
         conn.commit()
-        return {"status": "ok", "rows_affected": cursor.rowcount}
+        rows_affected = cursor.rowcount
+        cursor.close()
+        return {"status": "ok", "rows_affected": rows_affected}
     except Exception as e:
         st.error("Update failed.")
         st.exception(e)
@@ -155,9 +225,12 @@ def update_product_description(name, new_description):
 
 def delete_product(name):
     try:
+        conn, cursor = get_connection()
         cursor.execute(f'DELETE FROM "{SCHEMA_NAME}"."PRODUCT_EMBEDDINGS" WHERE NAME = ?', (name,))
         conn.commit()
-        return {"status": "ok", "rows_affected": cursor.rowcount}
+        rows_affected = cursor.rowcount
+        cursor.close()
+        return {"status": "ok", "rows_affected": rows_affected}
     except Exception as e:
         st.error("Delete failed.")
         st.exception(e)
@@ -165,8 +238,11 @@ def delete_product(name):
 
 def view_products(limit: int = 200):
     try:
+        conn, cursor = get_connection()
         cursor.execute(f'SELECT PRODUCT_ID, NAME, DESCRIPTION FROM "{SCHEMA_NAME}"."PRODUCT_EMBEDDINGS" ORDER BY PRODUCT_ID LIMIT {limit}')
-        return cursor.fetchall()
+        rows = cursor.fetchall()
+        cursor.close()
+        return rows
     except Exception as e:
         st.error("View products failed.")
         st.exception(e)
@@ -243,16 +319,7 @@ elif menu == "Delete Product":
                 st.error("Delete failed. Check logs.")
 
 # optional close
-def _close_conn():
-    try:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
-    except Exception:
-        pass
-
-st.button("Close DB Connection (optional)", on_click=_close_conn)
+st.button("Close DB Connection (optional)", on_click=close_session_connection)
 
 # Diagnostics expander (non-sensitive)
 with st.expander("Diagnostics / Debug"):
