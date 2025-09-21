@@ -1,7 +1,6 @@
-streamlit
+streamlit==1.28.0
+requests
 sentence-transformers
 cohere
+pytz
 hdbcli
-python-dotenv
-numpy
-rich
