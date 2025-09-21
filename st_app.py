@@ -1,4 +1,4 @@
-# app.py
+# st_app.py
 import streamlit as st
 import socket
 import traceback
@@ -9,8 +9,6 @@ from hdbcli import dbapi
 SCHEMA_NAME = "SMART_RETAIL1"
 
 # --- load hana config from Streamlit secrets ---
-# In Streamlit Cloud: Manage app -> Settings -> Secrets
-# Example secrets.toml keys shown below in the "Secrets" section.
 hana_config = {
     "address": st.secrets["hana"]["address"],
     "port": int(st.secrets["hana"]["port"]),
@@ -26,7 +24,6 @@ def get_connection(retries: int = 3, backoff_s: float = 2.0):
     host = hana_config["address"]
     port = hana_config["port"]
 
-    # Quick network check
     try:
         with socket.create_connection((host, port), timeout=8):
             pass
@@ -45,12 +42,12 @@ def get_connection(retries: int = 3, backoff_s: float = 2.0):
     tb = traceback.format_exception(type(last_exc), last_exc, last_exc.__traceback__)
     raise RuntimeError(f"Unable to connect to HANA after {retries} attempts. Last error: {last_exc}\nTraceback:\n{''.join(tb)}")
 
-# Initialize connection (show helpful UI if it fails)
+# Initialize connection
 try:
     conn = get_connection()
     cursor = conn.cursor()
 except Exception as e:
-    st.error("Database connection failed. See details below. (If secrets were exposed, rotate them.)")
+    st.error("Database connection failed. See details below. (Rotate password if it was exposed.)")
     st.exception(e)
     st.stop()
 
@@ -66,12 +63,11 @@ def get_product_description(name):
     return row[0] if row else "No description found."
 
 def insert_product(name, description):
-    # compute next product id
     cursor.execute(f'SELECT MAX(PRODUCT_ID) FROM "{SCHEMA_NAME}"."PRODUCT_EMBEDDINGS"')
     row = cursor.fetchone()
     max_id = row[0] if row and row[0] is not None else 0
     new_id = max_id + 1
-    # insert (VECTOR left NULL)
+
     cursor.execute(
         f'INSERT INTO "{SCHEMA_NAME}"."PRODUCT_EMBEDDINGS" (PRODUCT_ID, NAME, DESCRIPTION, VECTOR) VALUES (?,?,?,?)',
         (new_id, name, description, None)
@@ -114,12 +110,11 @@ if menu == "Product Insights":
 elif menu == "Insert Product":
     st.title("➕ Add New Product")
     new_name = st.text_input("Product name")
-    new_desc = st.text_area("Product description (optional) — leave empty to insert placeholder")
+    new_desc = st.text_area("Product description (optional)")
     if st.button("Insert"):
         if not new_name.strip():
             st.warning("Enter a product name.")
         else:
-            # if description empty, insert a simple placeholder
             description = new_desc.strip() or "AI-generated description placeholder."
             try:
                 new_id = insert_product(new_name.strip(), description)
@@ -134,7 +129,6 @@ elif menu == "View Products":
     if not rows:
         st.warning("No products found.")
     else:
-        # show as a table
         st.dataframe([{"PRODUCT_ID": r[0], "NAME": r[1], "DESCRIPTION": r[2]} for r in rows])
 
 elif menu == "Update Product":
@@ -171,7 +165,7 @@ elif menu == "Delete Product":
                 st.error(f"Delete failed: {e}")
                 st.exception(e)
 
-# Close cursor/connection gracefully on shutdown (optional)
+# optional close
 def _close_conn():
     try:
         cursor.close()
