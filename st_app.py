@@ -1,254 +1,112 @@
 # st_app.py
 import os
 import socket
-import ssl
 import time
 import traceback
+import pickle
 from datetime import datetime
 
 import streamlit as st
 
-# Try import hdbcli; fail gracefully with a helpful message in the UI.
+# try to import hdbcli; we'll surface a helpful message if it's not present
 try:
     from hdbcli import dbapi
 except Exception:
     dbapi = None
 
-# ---------- CONFIG ----------
 SCHEMA_NAME = os.environ.get("HANA_SCHEMA", "SMART_RETAIL1")
 
+# Read HANA config from environment (Render-friendly). Also allow Streamlit secrets.
 def _read_hana_config():
-    """
-    Prefer st.secrets['hana'] (Streamlit Cloud), otherwise environment variables.
-    Returns a dict with keys: address, port, user, password, encrypt, sslValidateCertificate
-    """
-    try:
-        if st.secrets and "hana" in st.secrets:
-            hana = st.secrets["hana"]
-            return {
-                "address": hana.get("address"),
-                "port": int(hana.get("port", 443)),
-                "user": hana.get("user"),
-                "password": hana.get("password"),
-                "encrypt": hana.get("encrypt", True),
-                "sslValidateCertificate": hana.get("sslValidateCertificate", False),
-            }
-    except Exception:
-        # ignore reading secrets failing (e.g., running locally)
-        pass
+    # Prefer st.secrets if present (Streamlit cloud), otherwise environment variables (Render)
+    if st.secrets and "hana" in st.secrets:
+        hana = st.secrets["hana"]
+        return {
+            "address": hana.get("address"),
+            "port": int(hana.get("port", 443)),
+            "user": hana.get("user"),
+            "password": hana.get("password"),
+            "encrypt": hana.get("encrypt", True),
+            "sslValidateCertificate": hana.get("sslValidateCertificate", False),
+        }
+    else:
+        # Render will supply env vars; don't commit secrets to repo
+        return {
+            "address": os.environ.get("HANA_ADDRESS"),
+            "port": int(os.environ.get("HANA_PORT", 443)),
+            "user": os.environ.get("HANA_USER"),
+            "password": os.environ.get("HANA_PASSWORD"),
+            "encrypt": os.environ.get("HANA_ENCRYPT", "true").lower() in ("1", "true", "yes"),
+            "sslValidateCertificate": os.environ.get("HANA_SSL_VALIDATE", "false").lower() in ("1", "true", "yes"),
+        }
 
-    return {
-        "address": os.environ.get("HANA_ADDRESS"),
-        "port": int(os.environ.get("HANA_PORT", 443)),
-        "user": os.environ.get("HANA_USER"),
-        "password": os.environ.get("HANA_PASSWORD"),
-        "encrypt": os.environ.get("HANA_ENCRYPT", "true").lower() in ("1", "true", "yes"),
-        "sslValidateCertificate": os.environ.get("HANA_SSL_VALIDATE", "false").lower() in ("1", "true", "yes"),
-    }
+hana_config = _read_hana_config()
 
-# ---------- HELPER CHECKS ----------
+# Helper: quick TCP test
 def tcp_check(host: str, port: int, timeout: float = 6.0):
-    """Simple TCP connect test (returns (ok:bool, message:str))."""
     try:
         t0 = time.time()
-        s = socket.create_connection((host, int(port)), timeout=timeout)
+        s = socket.create_connection((host, port), timeout=timeout)
         s.close()
         return True, f"TCP ok ({time.time()-t0:.2f}s)"
     except Exception as e:
         return False, str(e)
 
-def tls_handshake_check(host: str, port: int = 443, timeout: float = 6.0):
-    """Attempt a TLS handshake using ssl.create_default_context()."""
-    try:
-        raw = socket.create_connection((host, int(port)), timeout=timeout)
-        ctx = ssl.create_default_context()
-        ssock = ctx.wrap_socket(raw, server_hostname=host)
-        # getpeername or cipher to ensure handshake completed
-        _ = ssock.cipher()
-        ssock.close()
-        return True, "TLS handshake OK"
-    except Exception as e:
-        return False, str(e)
-
-def print_proxy_info():
-    p_https = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
-    p_http = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
-    st.write("HTTPS_PROXY:", p_https)
-    st.write("HTTP_PROXY:", p_http)
-    if p_https or p_http:
-        st.info("Proxy env detected — ensure the proxy allows outbound traffic to HANA host/port.")
-
-# ---------- INTERACTIVE FALLBACK (session-only) ----------
-def _prompt_for_hana_config_if_missing(cfg):
-    """
-    If address or port missing, show an ephemeral session-only form to allow developer input.
-    Values entered are stored only in st.session_state['hana_interactive'] for this session.
-    """
-    addr = cfg.get("address")
-    port = cfg.get("port")
-    if not addr or not port:
-        st.warning("HANA config missing. Enter connection details below (stored only for this session).")
-        with st.form("hana_config_form", clear_on_submit=False):
-            host_in = st.text_input("HANA host (address)", value=addr or "")
-            port_in = st.text_input("HANA port", value=str(port or 443))
-            user_in = st.text_input("HANA user", value=cfg.get("user") or "")
-            pwd_in = st.text_input("HANA password (session only)", value="", type="password")
-            encrypt_in = st.checkbox("Encrypt (TLS)", value=cfg.get("encrypt", True))
-            ssl_validate = st.checkbox("Validate SSL cert", value=cfg.get("sslValidateCertificate", False))
-            submitted = st.form_submit_button("Save (session only)")
-            if submitted:
-                try:
-                    shp = {
-                        "address": host_in.strip(),
-                        "port": int(port_in.strip() or 443),
-                        "user": user_in.strip(),
-                        "password": pwd_in,
-                        "encrypt": encrypt_in,
-                        "sslValidateCertificate": ssl_validate,
-                    }
-                    st.session_state["hana_interactive"] = shp
-                    st.success("HANA configuration stored for this session (not persisted).")
-                except Exception as e:
-                    st.error("Failed to parse values: " + str(e))
-
-        if st.session_state.get("hana_interactive"):
-            return st.session_state["hana_interactive"]
-        else:
-            return cfg
-    return cfg
-
-# ---------- CONNECTION MANAGEMENT ----------
-def _validate_connection(conn):
-    """
-    Validate a HANA connection by running a tiny query. Returns True/False.
-    """
-    try:
-        if conn is None:
-            return False
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1 FROM DUMMY")
-            _ = cur.fetchall()
-        return True
-    except Exception:
-        return False
-
-def get_connection(retries: int = 4, base_backoff: float = 1.0):
-    """
-    Return (conn, cursor). Keeps a validated connection in session_state['hana_conn'].
-    Recreates when validation fails. Raises RuntimeError with helpful trace on failure.
-    """
+# Cached connection builder
+@st.cache_resource
+def get_connection(retries: int = 3, backoff_s: float = 1.5):
     if dbapi is None:
-        raise RuntimeError("Python package 'hdbcli' is not installed. Install it (pip install hdbcli) or deploy a proxy/CF app.")
-
+        raise RuntimeError("Python package 'hdbcli' is not installed in the environment. Install it (or use a proxy/CF deployment).")
     host = hana_config.get("address")
     port = hana_config.get("port")
 
     if not host or not port:
-        raise RuntimeError("HANA configuration missing. Set HANA_ADDRESS and HANA_PORT environment variables or provide st.secrets['hana'].")
+        raise RuntimeError("HANA configuration missing. Set HANA_ADDRESS and HANA_PORT environment variables.")
 
-    # If we have a session-stored connection, validate and return
-    session_conn = st.session_state.get("hana_conn")
-    if _validate_connection(session_conn):
-        try:
-            cur = session_conn.cursor()
-            return session_conn, cur
-        except Exception:
-            # Fall through to reconnect
-            pass
-
-    # Pre-check TCP and TLS (useful diagnostics)
-    ok_tcp, tcp_msg = tcp_check(host, port)
-    ok_tls, tls_msg = tls_handshake_check(host, port)
-    if not ok_tcp:
-        st.warning(f"TCP pre-check to {host}:{port} failed -> {tcp_msg}")
-    if not ok_tls:
-        st.warning(f"TLS handshake pre-check to {host}:{port} failed -> {tls_msg}")
+    ok, msg = tcp_check(host, port, timeout=6.0)
+    if not ok:
+        raise ConnectionError(f"TCP check to {host}:{port} failed -> {msg}")
 
     last_exc = None
     for attempt in range(1, retries + 1):
         try:
             conn = dbapi.connect(**hana_config)
-            # Validate with a tiny query
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1 FROM DUMMY")
-                _ = cur.fetchall()
-            st.session_state["hana_conn"] = conn
-            cur = conn.cursor()
-            return conn, cur
-        except Exception as exc:
-            last_exc = exc
-            backoff = base_backoff * (2 ** (attempt - 1))
-            time.sleep(backoff)
+            return conn
+        except Exception as e:
+            last_exc = e
+            time.sleep(backoff_s * attempt)
 
     tb = "".join(traceback.format_exception(type(last_exc), last_exc, last_exc.__traceback__))
     raise RuntimeError(f"Unable to connect to HANA after {retries} attempts. Last error: {last_exc}\nTraceback:\n{tb}")
 
-def close_session_connection():
-    try:
-        c = st.session_state.get("hana_conn")
-        if c:
-            try:
-                c.close()
-            except Exception:
-                pass
-            st.session_state.pop("hana_conn", None)
-    except Exception:
-        pass
-
-# ---------- STARTUP: load config and possibly prompt ----------
-hana_config = _read_hana_config()
-hana_config = _prompt_for_hana_config_if_missing(hana_config)
-
-# Quick visible reminder about proxy env (non-sensitive)
-proxy_present = bool(os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy"))
-
-# Try to establish a connection (populate session_state) — fail gracefully with detailed diagnostics
+# Try to establish connection at startup (fail gracefully with a helpful message)
+conn = None
+cursor = None
 try:
-    # Only attempt if dbapi present
-    if dbapi is None:
-        raise RuntimeError("hdbcli not installed in environment.")
-
-    # Quick sanity: host/port present?
-    if not hana_config.get("address") or not hana_config.get("port"):
-        raise RuntimeError("HANA configuration missing. Set HANA_ADDRESS and HANA_PORT environment variables or provide st.secrets['hana'].")
-
-    # Try connecting (populates st.session_state['hana_conn'])
-    conn_tmp, cur_tmp = get_connection()
-    try:
-        cur_tmp.close()
-    except Exception:
-        pass
-
+    conn = get_connection()
+    cursor = conn.cursor()
 except Exception as e:
     st.error("🚨 HANA connection failed. See diagnostics below (do NOT commit credentials).")
     st.exception(e)
+    # show a minimal diagnostics panel (non-sensitive)
     with st.expander("Connection diagnostics (non-sensitive)"):
-        st.write("Local timestamp:", datetime.now().isoformat())
-        st.write("HANA host:", hana_config.get("address"))
-        st.write("HANA port:", hana_config.get("port"))
-        ok_tcp, tcp_msg = tcp_check(hana_config.get("address"), hana_config.get("port"))
-        if ok_tcp:
-            st.success("TCP check: " + tcp_msg)
+        host = hana_config.get("address")
+        port = hana_config.get("port")
+        st.write("HANA host:", host)
+        st.write("HANA port:", port)
+        ok, msg = tcp_check(host, port)
+        if ok:
+            st.success("TCP check: OK (" + msg + ")")
         else:
-            st.error("TCP check failed: " + tcp_msg)
-        ok_tls, tls_msg = tls_handshake_check(hana_config.get("address"), hana_config.get("port"))
-        if ok_tls:
-            st.success("TLS handshake: " + tls_msg)
-        else:
-            st.warning("TLS handshake problem: " + tls_msg)
-        print_proxy_info()
-        if dbapi is None:
-            st.warning("hdbcli not installed in environment. Install it (pip install hdbcli) or deploy a proxy/CF app.")
-        st.write("If you see 'Socket closed by peer', your runner's egress IP may be blocked by HANA Cloud or HANA requires Cloud Foundry / proxy inside the BTP subaccount.")
+            st.error("TCP check failed: " + msg)
+        st.write("If you see 'Socket closed by peer' or 'Invalid connect reply', the HANA instance likely restricts SQL access. Use Cloud Foundry or a proxy inside the BTP subaccount.")
     st.stop()
 
-# ---------- DB helper functions ----------
+# DB helper functions (safe, with clear errors)
 def fetch_product_names():
     try:
-        conn, cursor = get_connection()
         cursor.execute(f'SELECT DISTINCT NAME FROM "{SCHEMA_NAME}"."PRODUCT_EMBEDDINGS"')
         rows = cursor.fetchall()
-        cursor.close()
         return [r[0] for r in rows] if rows else []
     except Exception as e:
         st.error("Failed to fetch product names from HANA.")
@@ -257,10 +115,8 @@ def fetch_product_names():
 
 def get_product_description(name):
     try:
-        conn, cursor = get_connection()
         cursor.execute(f'SELECT DESCRIPTION FROM "{SCHEMA_NAME}"."PRODUCT_EMBEDDINGS" WHERE NAME = ?', (name,))
         row = cursor.fetchone()
-        cursor.close()
         return row[0] if row else "No description found."
     except Exception as e:
         st.error("Failed to fetch description.")
@@ -269,7 +125,6 @@ def get_product_description(name):
 
 def insert_product(name, description):
     try:
-        conn, cursor = get_connection()
         cursor.execute(f'SELECT MAX(PRODUCT_ID) FROM "{SCHEMA_NAME}"."PRODUCT_EMBEDDINGS"')
         row = cursor.fetchone()
         max_id = row[0] if row and row[0] is not None else 0
@@ -279,7 +134,6 @@ def insert_product(name, description):
             (new_id, name, description, None)
         )
         conn.commit()
-        cursor.close()
         return {"status": "ok", "product_id": new_id}
     except Exception as e:
         st.error("Insert failed.")
@@ -288,15 +142,12 @@ def insert_product(name, description):
 
 def update_product_description(name, new_description):
     try:
-        conn, cursor = get_connection()
         cursor.execute(
             f'UPDATE "{SCHEMA_NAME}"."PRODUCT_EMBEDDINGS" SET DESCRIPTION = ? WHERE NAME = ?',
             (new_description, name)
         )
         conn.commit()
-        rows_affected = cursor.rowcount
-        cursor.close()
-        return {"status": "ok", "rows_affected": rows_affected}
+        return {"status": "ok", "rows_affected": cursor.rowcount}
     except Exception as e:
         st.error("Update failed.")
         st.exception(e)
@@ -304,12 +155,9 @@ def update_product_description(name, new_description):
 
 def delete_product(name):
     try:
-        conn, cursor = get_connection()
         cursor.execute(f'DELETE FROM "{SCHEMA_NAME}"."PRODUCT_EMBEDDINGS" WHERE NAME = ?', (name,))
         conn.commit()
-        rows_affected = cursor.rowcount
-        cursor.close()
-        return {"status": "ok", "rows_affected": rows_affected}
+        return {"status": "ok", "rows_affected": cursor.rowcount}
     except Exception as e:
         st.error("Delete failed.")
         st.exception(e)
@@ -317,17 +165,14 @@ def delete_product(name):
 
 def view_products(limit: int = 200):
     try:
-        conn, cursor = get_connection()
         cursor.execute(f'SELECT PRODUCT_ID, NAME, DESCRIPTION FROM "{SCHEMA_NAME}"."PRODUCT_EMBEDDINGS" ORDER BY PRODUCT_ID LIMIT {limit}')
-        rows = cursor.fetchall()
-        cursor.close()
-        return rows
+        return cursor.fetchall()
     except Exception as e:
         st.error("View products failed.")
         st.exception(e)
         return []
 
-# ---------- Streamlit UI ----------
+# ----------------- Streamlit UI -----------------
 st.sidebar.title("🔍 Select Action")
 menu = st.sidebar.selectbox("", ["Product Insights", "Insert Product", "View Products", "Update Product", "Delete Product"])
 
@@ -398,9 +243,18 @@ elif menu == "Delete Product":
                 st.error("Delete failed. Check logs.")
 
 # optional close
-st.button("Close DB Connection (optional)", on_click=close_session_connection)
+def _close_conn():
+    try:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+    except Exception:
+        pass
 
-# Diagnostics / Debug expander (non-sensitive)
+st.button("Close DB Connection (optional)", on_click=_close_conn)
+
+# Diagnostics expander (non-sensitive)
 with st.expander("Diagnostics / Debug"):
     st.write("Local timestamp:", datetime.now().isoformat())
     st.write("HANA host:", hana_config.get("address"))
@@ -410,11 +264,5 @@ with st.expander("Diagnostics / Debug"):
         st.success("TCP check: " + msg)
     else:
         st.error("TCP check failed: " + msg)
-    ok_tls, tls_msg = tls_handshake_check(hana_config.get("address"), hana_config.get("port"))
-    if ok_tls:
-        st.success("TLS handshake: " + tls_msg)
-    else:
-        st.warning("TLS handshake issue: " + tls_msg)
-    print_proxy_info()
     if dbapi is None:
-        st.warning("hdbcli not installed in environment — install it (pip install hdbcli) or deploy a proxy/CF app.")
+        st.warning("hdbcli not installed in environment. Install it or deploy a proxy/CF app.")
